@@ -168,6 +168,8 @@ EOF
 fi
 
 # ---------- 5. Xray 配置 ----------
+# 路由规则里屏蔽了 geosite:cn / geoip:cn：境外服务器替你访问国内站点（「回国」流量）
+# 是很典型的异常特征，国内网站本就应该由客户端直连。
 log "写入 Xray 配置"
 CDN_INBOUND=""
 if [ -n "$CDN_DOMAIN" ]; then
@@ -215,9 +217,13 @@ cat > /usr/local/etc/xray/config.json <<EOF
     { "tag": "block", "protocol": "blackhole" }
   ],
   "routing": {
+    "domainStrategy": "IPIfNonMatch",
     "rules": [
       { "ip": ["geoip:private"], "outboundTag": "block" },
-      { "protocol": ["bittorrent"], "outboundTag": "block" }
+      { "protocol": ["bittorrent"], "outboundTag": "block" },
+      { "domain": ["geosite:category-ads-all"], "outboundTag": "block" },
+      { "domain": ["geosite:cn"], "outboundTag": "block" },
+      { "ip": ["geoip:cn"], "outboundTag": "block" }
     ]
   }
 }
@@ -252,10 +258,28 @@ printf '%s\n' "$LINKS" | base64 -w0 > "$SUB_DIR/v2ray.txt"
 # Clash Verge / Clash Meta for Android / Stash：mihomo 配置
 {
   cat <<EOF
+# 由 install.sh 生成。分流规则数据来自 MetaCubeX/meta-rules-dat
+# （整合了 Loyalsoldier/v2ray-rules-dat、v2fly/domain-list-community、felixonmars/dnsmasq-china-list）
 mixed-port: 7890
 allow-lan: false
 mode: rule
-log-level: info
+log-level: warning
+unified-delay: true
+tcp-concurrent: true
+geo-auto-update: true
+geo-update-interval: 72
+geox-url:
+  geoip: https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat
+  geosite: https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat
+  mmdb: https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/country-lite.mmdb
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter: ['*.lan', '+.local', '+.msftconnecttest.com', '+.msftncsi.com', 'time.*.com', '+.ntp.org', '+.stun.*.*']
+  default-nameserver: [223.5.5.5, 119.29.29.29]
+  nameserver: [https://dns.alidns.com/dns-query, https://doh.pub/dns-query]
 proxies:
   - name: $NAME_R
     type: vless
@@ -298,13 +322,23 @@ proxy-groups:
   - name: 节点选择
     type: select
     proxies: [自动回退, DIRECT]
+  # fallback 只在主节点不可用时才切换，不会像 url-test 那样随延迟来回跳，出口 IP 保持稳定
+  # lazy：只有在用这个组时才做健康检查，减少无意义的周期性探测流量
   - name: 自动回退
     type: fallback
     url: https://www.gstatic.com/generate_204
-    interval: 300
+    interval: 600
+    lazy: true
     proxies: $MEMBERS
 rules:
-  - GEOIP,LAN,DIRECT,no-resolve
+  - GEOSITE,private,DIRECT
+  - GEOIP,private,DIRECT,no-resolve
+  - GEOSITE,category-ads-all,REJECT
+  - GEOSITE,cn,DIRECT
+  - GEOIP,CN,DIRECT,no-resolve
+  # 禁用境外 QUIC（UDP 443）：浏览器会自动退回 TCP，避免 UDP 走代理带来的不稳定和异常特征
+  - AND,((NETWORK,UDP),(DST-PORT,443)),REJECT
+  - GEOSITE,geolocation-!cn,节点选择
   - GEOIP,CN,DIRECT
   - MATCH,节点选择
 EOF
@@ -338,6 +372,7 @@ fi
     echo "------------ 订阅链接（客户端里「从 URL 导入」） ------------"
     echo "Clash Verge / Clash Meta / Stash:  $BASE/clash.yaml"
     echo "v2rayN / v2rayNG / Shadowrocket:   $BASE/v2ray.txt"
+    echo "（Clash 订阅已含国内直连和广告拦截规则；v2rayN 系订阅只含节点，请在客户端把路由设为「绕过大陆」）"
     echo
     echo "Clash Verge 一键导入：clash://install-config?url=$(printf '%s' "$BASE/clash.yaml" | sed 's#:#%3A#g; s#/#%2F#g')"
     echo "订阅地址等同于密码，不要公开；要作废就删掉 $SUB_DIR 并重跑脚本。"
