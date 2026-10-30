@@ -6,25 +6,31 @@
 #   有域名（推荐）：self-steal + HTTPS 订阅链接 + 可选 Cloudflare CDN 备用链路
 #     bash install.sh --domain www.example.com [--cdn-domain cdn.example.com] [--email you@example.com]
 #   无域名：借用第三方站点做 Reality 目标，只输出分享链接、二维码和本地订阅文件
-#     bash install.sh [--target www.microsoft.com]
+#     bash install.sh [--target www.nvidia.com]
+#   加 --clash：额外生成 Clash 订阅（会安装兼容 Clash 的旧版 Xray，见 CLASH_XRAY_VERSION）
 set -euo pipefail
 
 DOMAIN=""
 CDN_DOMAIN=""
 EMAIL=""
-TARGET="www.microsoft.com"
+TARGET="www.nvidia.com"
 FORCE=0
+CLASH=0
+# 新版 Xray（v26.9 起）的 REALITY 服务端不再接受 Clash 内核（mihomo）连接，
+# 需要 Clash 订阅时固定安装这个版本。等 mihomo 跟进后去掉 --clash 重跑即可升级。
+CLASH_XRAY_VERSION="v26.7.11"
 
 usage() {
   cat <<'EOF'
 用法：
   bash install.sh --domain www.example.com [--cdn-domain cdn.example.com] [--email you@example.com]
-  bash install.sh [--target www.microsoft.com]
+  bash install.sh [--target www.nvidia.com]
 
   --domain      回落站点域名，需已解析到本机（Cloudflare 灰色云朵）。提供后启用 self-steal 和 HTTPS 订阅
   --cdn-domain  可选，CDN 备用链路域名（Cloudflare 橙色云朵），需同时提供 --domain
   --email       可选，Let's Encrypt 到期提醒邮箱
-  --target      无域名模式下借用的站点，默认 www.microsoft.com
+  --target      无域名模式下借用的站点，默认 www.nvidia.com
+  --clash       额外生成 Clash 订阅（Clash Verge / Clash Meta / Stash），会安装兼容 Clash 的旧版 Xray
   --force       443 已被占用时也继续（需自行处理原有服务）
 EOF
   exit 1
@@ -39,6 +45,7 @@ while [ $# -gt 0 ]; do
     --email) EMAIL="$2"; shift 2 ;;
     --target) TARGET="$2"; shift 2 ;;
     --force) FORCE=1; shift ;;
+    --clash) CLASH=1; shift ;;
     -h|--help) usage ;;
     *) die "未知参数：$1" ;;
   esac
@@ -51,16 +58,34 @@ case "$ID" in debian|ubuntu) ;; *) die "只支持 Debian / Ubuntu，当前是 $I
 
 # ---------- 1. 前置检查 ----------
 log "检查环境"
-if ss -ltn '( sport = :443 )' | grep -q LISTEN && [ "$FORCE" -eq 0 ]; then
-  die "443 端口已被占用（$(ss -ltnp '( sport = :443 )' | awk 'NR==2{print $NF}')）。
+# 返回监听某端口的进程的可执行文件路径（没人监听则为空）
+port_owner() {
+  local pid
+  pid=$(ss -ltnpH "( sport = :$1 )" | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+  [ -n "$pid" ] && readlink -f "/proc/$pid/exe" || true
+}
+owner443=$(port_owner 443)
+# 443 被本脚本装的 Xray 占用时视为重跑，允许继续
+if [ -n "$owner443" ] && [ "$owner443" != /usr/local/bin/xray ] && [ "$FORCE" -eq 0 ]; then
+  die "443 端口已被 $owner443 占用。
 已有网站的机器请先按教程把它们改成 listen 127.0.0.1:8443，或加 --force 跳过此检查。"
+fi
+if [ -n "$DOMAIN" ]; then
+  owner80=$(port_owner 80)
+  if [ -n "$owner80" ] && [ "$owner80" != /usr/sbin/nginx ]; then
+    die "80 端口已被 $owner80 占用（常见于宝塔等面板自带的 Nginx）。
+本脚本会安装系统自带的 Nginx 来申请证书，请先停用原来的 Web 服务，或按教程手动配置。"
+  fi
 fi
 
 apt-get update -qq
 PKGS="curl openssl dnsutils qrencode"
 [ -n "$DOMAIN" ] && PKGS="$PKGS nginx certbot"
 # shellcheck disable=SC2086
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $PKGS >/dev/null
+# 已有同名配置文件（比如面板留下的 /etc/init.d/nginx）时保留原文件，不弹交互提示
+APT_OPTS=(-y -qq -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+DEBIAN_FRONTEND=noninteractive dpkg --force-confdef --force-confold --configure -a >/dev/null 2>&1 || true
+DEBIAN_FRONTEND=noninteractive apt-get install "${APT_OPTS[@]}" $PKGS >/dev/null
 
 SERVER_IP=$(curl -fsS4 --max-time 10 https://api.ipify.org || true)
 [ -n "$SERVER_IP" ] || die "获取不到本机公网 IPv4"
@@ -89,15 +114,18 @@ EOF
 sysctl -q --system
 
 # ---------- 3. Xray ----------
-log "安装 Xray"
-bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install >/dev/null
+XRAY_ARGS=()
+if [ "$CLASH" -eq 1 ]; then XRAY_ARGS=(--version "$CLASH_XRAY_VERSION"); fi
+log "安装 Xray ${XRAY_ARGS[1]:-（最新版）}"
+bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install "${XRAY_ARGS[@]}" \
+  >/var/log/xray-install.log 2>&1 || die "Xray 安装失败，详见 /var/log/xray-install.log"
 XRAY=/usr/local/bin/xray
 
 UUID=$($XRAY uuid)
 KEYS=$($XRAY x25519)
-# 旧版输出 "Private key / Public key"，新版输出 "PrivateKey / Password"
-PRIV=$(printf '%s\n' "$KEYS" | awk -F': *' 'tolower($1) ~ /^private ?key$/ {print $2}')
-PUB=$(printf '%s\n' "$KEYS" | awk -F': *' 'tolower($1) ~ /^(public ?key|password)$/ {print $2}')
+# 不同版本的输出格式不同："Private key / Public key"、"PrivateKey / Password"、"PrivateKey / Password (PublicKey)"
+PRIV=$(printf '%s\n' "$KEYS" | awk -F': *' 'tolower($1) ~ /^private ?key/ {print $2}')
+PUB=$(printf '%s\n' "$KEYS" | awk -F': *' 'tolower($1) ~ /^(public ?key|password)/ {print $2}')
 [ -n "$PRIV" ] && [ -n "$PUB" ] || die "无法解析 xray x25519 的输出：$KEYS"
 SID=$(openssl rand -hex 8)
 WS_PATH="/$(openssl rand -hex 6)"
@@ -134,10 +162,17 @@ EOF
   chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
 
   log "配置 Nginx 回落站点（127.0.0.1:8443）"
+  # nginx 1.25.1 起用 "http2 on;"，更早的版本（如 Debian 12 自带的 1.22）要写在 listen 里
+  NGINX_VER=$(nginx -v 2>&1 | grep -o '[0-9.]*$')
+  if [ "$(printf '%s\n%s\n' "$NGINX_VER" 1.25.1 | sort -V | head -1)" = 1.25.1 ]; then
+    LISTEN_LINE="listen 127.0.0.1:8443 ssl;
+    http2 on;"
+  else
+    LISTEN_LINE="listen 127.0.0.1:8443 ssl http2;"
+  fi
   cat > /etc/nginx/conf.d/site.conf <<EOF
 server {
-    listen 127.0.0.1:8443 ssl;
-    http2 on;
+    $LISTEN_LINE
     server_name $NAMES;
 
     ssl_certificate     /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
@@ -171,6 +206,10 @@ fi
 # 路由规则里屏蔽了 geosite:cn / geoip:cn：境外服务器替你访问国内站点（「回国」流量）
 # 是很典型的异常特征，国内网站本就应该由客户端直连。
 log "写入 Xray 配置"
+# Clash 兼容模式下放宽客户端版本限制，否则 mihomo 会被拒绝
+MIN_VER=""
+if [ "$CLASH" -eq 1 ]; then MIN_VER=',
+          "minClientVer": "0.0.0"'; fi
 CDN_INBOUND=""
 if [ -n "$CDN_DOMAIN" ]; then
   CDN_INBOUND=$(cat <<EOF
@@ -206,7 +245,7 @@ cat > /usr/local/etc/xray/config.json <<EOF
           "dest": "$DEST",
           "serverNames": ["$SNI"],
           "privateKey": "$PRIV",
-          "shortIds": ["$SID"]
+          "shortIds": ["$SID"]$MIN_VER
         }
       },
       "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true }
@@ -255,7 +294,8 @@ mkdir -p "$SUB_DIR"
 # v2rayN / v2rayNG / Shadowrocket：Base64 编码的分享链接列表
 printf '%s\n' "$LINKS" | base64 -w0 > "$SUB_DIR/v2ray.txt"
 
-# Clash Verge / Clash Meta for Android / Stash：mihomo 配置
+# Clash Verge / Clash Meta for Android / Stash：mihomo 配置（仅 --clash）
+if [ "$CLASH" -eq 1 ]; then
 {
   cat <<EOF
 # 由 install.sh 生成。分流规则数据来自 MetaCubeX/meta-rules-dat
@@ -343,14 +383,28 @@ rules:
   - MATCH,节点选择
 EOF
 } > "$SUB_DIR/clash.yaml"
+fi
 chmod 644 "$SUB_DIR"/*
 
 # ---------- 7. 自检 ----------
 if [ -n "$DOMAIN" ]; then
   log "自检：经 Reality 回落访问伪装站和订阅"
-  code=$(curl -s -o /dev/null -w '%{http_code}' --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/")
-  [ "$code" = "200" ] || die "回落站点返回 $code，预期 200"
-  code=$(curl -s -o /dev/null -w '%{http_code}' --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/sub/$SUB_TOKEN/clash.yaml")
+  # 先经公网 IP 访问（和外部访客看到的一致），不通再试本机回环；curl 失败不能让 set -e 静默退出
+  # 刚重启的 Xray 可能还没就绪，最多重试约 15 秒
+  probe() {
+    local ip c i
+    for i in 1 2 3 4 5; do
+      for ip in "$SERVER_IP" 127.0.0.1; do
+        c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --resolve "$DOMAIN:443:$ip" "https://$DOMAIN$1" || true)
+        [ "$c" = 200 ] && { echo 200; return; }
+      done
+      sleep 2
+    done
+    echo "${c:-000}"
+  }
+  code=$(probe /)
+  [ "$code" = "200" ] || die "回落站点返回 $code，预期 200。检查：nginx -t、ss -ltnp | grep 8443、journalctl -u xray -e"
+  code=$(probe "/sub/$SUB_TOKEN/v2ray.txt")
   [ "$code" = "200" ] || die "订阅地址返回 $code，预期 200"
 fi
 
@@ -370,20 +424,36 @@ fi
   if [ -n "$DOMAIN" ]; then
     BASE="https://$DOMAIN/sub/$SUB_TOKEN"
     echo "------------ 订阅链接（客户端里「从 URL 导入」） ------------"
-    echo "Clash Verge / Clash Meta / Stash:  $BASE/clash.yaml"
     echo "v2rayN / v2rayNG / Shadowrocket:   $BASE/v2ray.txt"
-    echo "（Clash 订阅已含国内直连和广告拦截规则；v2rayN 系订阅只含节点，请在客户端把路由设为「绕过大陆」）"
+    echo "（只含节点，请在客户端把路由设为「绕过大陆」）"
+    if [ "$CLASH" -eq 1 ]; then
+      echo "Clash Verge / Clash Meta / Stash:  $BASE/clash.yaml"
+      echo "（已含国内直连、广告拦截和自动回退规则）"
+      echo "Clash Verge 一键导入：clash://install-config?url=$(printf '%s' "$BASE/clash.yaml" | sed 's#:#%3A#g; s#/#%2F#g')"
+    fi
     echo
-    echo "Clash Verge 一键导入：clash://install-config?url=$(printf '%s' "$BASE/clash.yaml" | sed 's#:#%3A#g; s#/#%2F#g')"
     echo "订阅地址等同于密码，不要公开；要作废就删掉 $SUB_DIR 并重跑脚本。"
   else
     echo "------------ 订阅文件（无域名，未对外提供） ------------"
-    echo "$SUB_DIR/clash.yaml   用 scp 下载后在 Clash Verge 里「导入本地文件」"
     echo "$SUB_DIR/v2ray.txt    内容可直接粘贴到 v2rayN「从剪贴板导入」"
+    if [ "$CLASH" -eq 1 ]; then
+      echo "$SUB_DIR/clash.yaml   用 scp 下载后在 Clash Verge 里「导入本地文件」"
+    fi
   fi
   if [ -n "$CDN_DOMAIN" ]; then
     echo
     echo "备用链路需在 Cloudflare 把 $CDN_DOMAIN 设为已代理，SSL/TLS 设为完整（严格）。"
+  fi
+  echo
+  if [ "$CLASH" -eq 1 ]; then
+    echo "------------ Clash 兼容模式说明 ------------"
+    echo "已安装 Xray $CLASH_XRAY_VERSION 并放宽客户端版本限制，Clash 系客户端才能连接。"
+    echo "Xray 官方提示放宽版本限制会增加服务器 IP 被识别的风险，能用 v2rayN / v2rayNG 的设备建议优先使用。"
+    echo "在此期间不要用 Xray 官方安装命令升级，否则 Clash 会连不上。"
+    echo "等 Clash 内核（mihomo）支持新版 Xray 后，去掉 --clash 重跑本脚本即可升级到最新版。"
+  else
+    echo "提示：新版 Xray 暂不支持 Clash 系客户端（Clash Verge / Clash Meta / Stash），本次未生成 Clash 订阅。"
+    echo "推荐使用 v2rayN（Windows / macOS / Linux）或 v2rayNG（Android）；确实需要 Clash，可加 --clash 重跑。"
   fi
 } | tee /root/xray-info.txt
 chmod 600 /root/xray-info.txt

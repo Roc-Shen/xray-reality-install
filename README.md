@@ -1,6 +1,6 @@
 # xray-reality-install
 
-Xray VLESS + Reality + Vision 一键部署脚本。部署完成后输出 Clash / v2rayN / Shadowrocket 等客户端的订阅链接和二维码。
+Xray VLESS + Reality + Vision 一键部署脚本。部署完成后输出 v2rayN / v2rayNG / Shadowrocket 等客户端的订阅链接和二维码；加 `--clash` 可额外生成 Clash 订阅。
 
 完整原理与手动配置步骤见教程：<https://blog.roc.plus/posts/xray-reality-selfhost/>
 
@@ -26,7 +26,8 @@ bash <(curl -fsSL https://roc-shen.github.io/xray-reality-install/install.sh)
 | `--domain` | 回落站点域名，需已解析到本机（Cloudflare 灰色云朵） |
 | `--cdn-domain` | 可选，CDN 备用链路域名（Cloudflare 橙色云朵） |
 | `--email` | 可选，Let's Encrypt 到期提醒邮箱 |
-| `--target` | 无域名模式借用的站点，默认 `www.microsoft.com` |
+| `--target` | 无域名模式借用的站点，默认 `www.nvidia.com` |
+| `--clash` | 额外生成 Clash 订阅（Clash Verge / Clash Meta / Stash），运行结束时会打印相关说明 |
 | `--force` | 443 已被占用时仍继续 |
 
 脚本会占用 443 端口，并改写 Nginx 配置。已有网站的服务器请先阅读教程，不要直接运行。
